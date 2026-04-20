@@ -8,6 +8,7 @@ import os
 import sys
 import hashlib
 import sqlite3
+import json
 from pathlib import Path
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -16,6 +17,10 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QPixmap
+
+
+# Файл для сохранения состояния
+STATE_FILE = "scan_state.json"
 
 
 class ImageHasher:
@@ -148,13 +153,15 @@ class ScanWorker(QThread):
     
     progress_signal = pyqtSignal(int, str)  # прогресс, текущий файл
     found_signal = pyqtSignal(str, str, int)  # путь, хэш, размер
-    finished_signal = pyqtSignal(list)  # список всех найденных файлов
+    finished_signal = pyqtSignal(list, bool)  # список всех найденных файлов, завершено ли полностью
     error_signal = pyqtSignal(str)
     
-    def __init__(self, folder_path, db_path):
+    def __init__(self, folder_path, db_path, start_index=0, processed_files=None):
         super().__init__()
         self.folder_path = folder_path
         self.db_path = db_path
+        self.start_index = start_index
+        self.processed_files = processed_files or []
         self.is_supported_image = lambda p: p.lower().endswith(
             ('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif', '.webp')
         )
@@ -192,11 +199,16 @@ class ScanWorker(QThread):
                     if self.is_supported_image(file_path):
                         image_files.append(file_path)
             
-            total = len(image_files)
+            # Пропускаем уже обработанные файлы при возобновлении
+            image_files_to_process = [f for f in image_files if f not in self.processed_files]
+            
+            total = len(image_files_to_process)
             processed = 0
             
-            for file_path in image_files:
+            for file_path in image_files_to_process:
                 if self._stop_flag:
+                    # Сохраняем состояние перед остановкой
+                    self._save_state(processed, image_files[:len(image_files)-len(image_files_to_process)+processed])
                     break
                 
                 # Проверка паузы
@@ -224,15 +236,49 @@ class ScanWorker(QThread):
                         self.found_signal.emit(file_path, file_hash, file_size)
                     
                     processed += 1
-                    self.progress_signal.emit(int(100 * processed / total), file_path)
+                    self.progress_signal.emit(int(100 * processed / max(total, 1)), file_path)
                     
                 except Exception as e:
                     self.error_signal.emit(f"Ошибка обработки {file_path}: {str(e)}")
             
-            self.finished_signal.emit(image_files)
+            # Если дошли до конца, очищаем файл состояния
+            completed = not self._stop_flag
+            if completed:
+                self._clear_state()
+            else:
+                # Сохраняем состояние при прерывании
+                self._save_state(processed, image_files[:len(image_files)-len(image_files_to_process)+processed])
+            
+            self.finished_signal.emit(image_files, completed)
             
         except Exception as e:
             self.error_signal.emit(f"Критическая ошибка: {str(e)}")
+    
+    def _get_state_file_path(self):
+        """Получить путь к файлу состояния."""
+        return os.path.join(self.folder_path, STATE_FILE)
+    
+    def _save_state(self, processed_count, processed_files):
+        """Сохранить состояние сканирования."""
+        state = {
+            'folder_path': self.folder_path,
+            'processed_count': processed_count,
+            'processed_files': processed_files
+        }
+        try:
+            with open(self._get_state_file_path(), 'w', encoding='utf-8') as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"Ошибка сохранения состояния: {e}")
+    
+    def _clear_state(self):
+        """Очистить файл состояния."""
+        try:
+            state_file = self._get_state_file_path()
+            if os.path.exists(state_file):
+                os.remove(state_file)
+        except Exception as e:
+            print(f"Ошибка очистки состояния: {e}")
 
 
 class DuplicateFinderWorker(QThread):
@@ -320,10 +366,10 @@ class MainWindow(QMainWindow):
         self.btn_scan.setEnabled(False)
         top_panel.addWidget(self.btn_scan)
         
-        self.btn_pause = QPushButton("Пауза")
-        self.btn_pause.clicked.connect(self.toggle_pause)
-        self.btn_pause.setEnabled(False)
-        top_panel.addWidget(self.btn_pause)
+        self.btn_stop = QPushButton("Стоп")
+        self.btn_stop.clicked.connect(self.stop_scan)
+        self.btn_stop.setEnabled(False)
+        top_panel.addWidget(self.btn_stop)
         
         self.btn_find_duplicates = QPushButton("Найти дубли")
         self.btn_find_duplicates.clicked.connect(self.start_find_duplicates)
@@ -412,7 +458,7 @@ class MainWindow(QMainWindow):
             return
         
         self.btn_scan.setEnabled(False)
-        self.btn_pause.setEnabled(True)
+        self.btn_stop.setEnabled(True)
         self.btn_find_duplicates.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
@@ -420,12 +466,37 @@ class MainWindow(QMainWindow):
         self.current_duplicates = []
         self.is_scanning = True
         self.is_paused = False
-        self.btn_pause.setText("Пауза")
         
         # Используем путь к БД напрямую
         db_path = os.path.join(self.folder_path, "image_hashes.db")
         
-        self.scan_worker = ScanWorker(self.folder_path, db_path)
+        # Проверяем наличие сохраненного состояния
+        state_file = os.path.join(self.folder_path, STATE_FILE)
+        start_index = 0
+        processed_files = []
+        
+        if os.path.exists(state_file):
+            try:
+                with open(state_file, 'r', encoding='utf-8') as f:
+                    state = json.load(f)
+                    processed_files = state.get('processed_files', [])
+                    start_index = len(processed_files)
+                    self.log_message(f"Найдено сохраненное состояние. Продолжаем с {start_index} файла.")
+                    # Загружаем уже обработанные файлы в таблицу
+                    conn = sqlite3.connect(db_path)
+                    cursor = conn.cursor()
+                    for pf in processed_files:
+                        cursor.execute('SELECT file_hash, file_size FROM images WHERE file_path = ?', (pf,))
+                        result = cursor.fetchone()
+                        if result:
+                            self.add_file_to_table(pf, result[0], result[1])
+                    conn.close()
+            except Exception as e:
+                self.log_message(f"Ошибка загрузки состояния: {e}")
+                processed_files = []
+                start_index = 0
+        
+        self.scan_worker = ScanWorker(self.folder_path, db_path, start_index, processed_files)
         self.scan_worker.progress_signal.connect(self.update_progress)
         self.scan_worker.found_signal.connect(self.add_file_to_table)
         self.scan_worker.finished_signal.connect(self.on_scan_finished)
@@ -434,23 +505,16 @@ class MainWindow(QMainWindow):
         
         self.log_message("Начато сканирование...")
     
-    def toggle_pause(self):
-        """Переключение паузы."""
+    def stop_scan(self):
+        """Остановка сканирования с сохранением состояния."""
         if not self.scan_worker:
             return
         
-        if self.is_paused:
-            # Возобновить
-            self.scan_worker.resume()
-            self.btn_pause.setText("Пауза")
-            self.is_paused = False
-            self.log_message("Сканирование возобновлено")
-        else:
-            # Поставить на паузу
-            self.scan_worker.pause()
-            self.btn_pause.setText("Продолжить")
-            self.is_paused = True
-            self.log_message("Сканирование приостановлено")
+        self.scan_worker.stop()
+        self.btn_stop.setEnabled(False)
+        self.is_scanning = False
+        self.is_paused = False
+        self.log_message("Сканирование остановлено. Состояние сохранено для продолжения позже.")
     
     def update_progress(self, value, current_file):
         """Обновление прогресс бара."""
@@ -467,16 +531,21 @@ class MainWindow(QMainWindow):
         self.table_widget.setItem(row, 2, QTableWidgetItem(f"{file_size / 1024:.1f}"))
         self.table_widget.setItem(row, 3, QTableWidgetItem("Отсканировано"))
     
-    def on_scan_finished(self, files):
+    def on_scan_finished(self, files, completed):
         """Завершение сканирования."""
         self.btn_scan.setEnabled(True)
-        self.btn_pause.setEnabled(False)
+        self.btn_stop.setEnabled(False)
         self.btn_find_duplicates.setEnabled(True)
         self.progress_bar.setVisible(False)
         self.is_scanning = False
         self.is_paused = False
-        self.lbl_status.setText(f"Сканирование завершено. Найдено {len(files)} изображений.")
-        self.log_message(f"Сканирование завершено. Найдено {len(files)} изображений.")
+        
+        if completed:
+            self.lbl_status.setText(f"Сканирование завершено. Найдено {len(files)} изображений.")
+            self.log_message(f"Сканирование завершено. Найдено {len(files)} изображений.")
+        else:
+            self.lbl_status.setText(f"Сканирование прервано. Обработано {len(files)} изображений.")
+            self.log_message(f"Сканирование прервано. Состояние сохранено. Обработано {len(files)} изображений.")
     
     def start_find_duplicates(self):
         """Запуск поиска дублей."""
@@ -534,7 +603,7 @@ class MainWindow(QMainWindow):
         self.log_message(f"ОШИБКА: {error_msg}")
         QMessageBox.warning(self, "Ошибка", error_msg)
         self.btn_scan.setEnabled(True)
-        self.btn_pause.setEnabled(False)
+        self.btn_stop.setEnabled(False)
         self.btn_find_duplicates.setEnabled(True)
         self.progress_bar.setVisible(False)
         self.is_scanning = False
