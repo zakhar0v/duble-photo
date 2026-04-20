@@ -151,13 +151,27 @@ class ScanWorker(QThread):
     finished_signal = pyqtSignal(list)  # список всех найденных файлов
     error_signal = pyqtSignal(str)
     
-    def __init__(self, folder_path, db_manager):
+    def __init__(self, folder_path, db_path):
         super().__init__()
         self.folder_path = folder_path
-        self.db_manager = db_manager
+        self.db_path = db_path
         self.is_supported_image = lambda p: p.lower().endswith(
             ('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif', '.webp')
         )
+        self._pause_flag = False
+        self._stop_flag = False
+    
+    def pause(self):
+        """Поставить сканирование на паузу."""
+        self._pause_flag = True
+    
+    def resume(self):
+        """Возобновить сканирование."""
+        self._pause_flag = False
+    
+    def stop(self):
+        """Остановить сканирование."""
+        self._stop_flag = True
     
     def run(self):
         """Основной метод потока."""
@@ -167,7 +181,11 @@ class ScanWorker(QThread):
             
             # Сбор всех файлов
             for root, dirs, files in os.walk(self.folder_path):
+                if self._stop_flag:
+                    break
                 for file in files:
+                    if self._stop_flag:
+                        break
                     file_path = os.path.join(root, file)
                     all_files.append(file_path)
                     
@@ -178,12 +196,31 @@ class ScanWorker(QThread):
             processed = 0
             
             for file_path in image_files:
+                if self._stop_flag:
+                    break
+                
+                # Проверка паузы
+                while self._pause_flag and not self._stop_flag:
+                    self.msleep(100)
+                
+                if self._stop_flag:
+                    break
+                
                 try:
                     file_size = os.path.getsize(file_path)
                     file_hash = ImageHasher.compute_hash(file_path)
                     
                     if file_hash:
-                        self.db_manager.add_image(file_path, file_hash, file_size)
+                        # Создаем новое соединение для каждого файла
+                        conn = sqlite3.connect(self.db_path)
+                        cursor = conn.cursor()
+                        cursor.execute('''
+                            INSERT OR REPLACE INTO images (file_path, file_hash, file_size)
+                            VALUES (?, ?, ?)
+                        ''', (file_path, file_hash, file_size))
+                        conn.commit()
+                        conn.close()
+                        
                         self.found_signal.emit(file_path, file_hash, file_size)
                     
                     processed += 1
@@ -254,6 +291,8 @@ class MainWindow(QMainWindow):
         self.scan_worker = None
         self.finder_worker = None
         self.current_duplicates = []
+        self.is_scanning = False
+        self.is_paused = False
         
         self.init_ui()
     
@@ -280,6 +319,11 @@ class MainWindow(QMainWindow):
         self.btn_scan.clicked.connect(self.start_scan)
         self.btn_scan.setEnabled(False)
         top_panel.addWidget(self.btn_scan)
+        
+        self.btn_pause = QPushButton("Пауза")
+        self.btn_pause.clicked.connect(self.toggle_pause)
+        self.btn_pause.setEnabled(False)
+        top_panel.addWidget(self.btn_pause)
         
         self.btn_find_duplicates = QPushButton("Найти дубли")
         self.btn_find_duplicates.clicked.connect(self.start_find_duplicates)
@@ -368,13 +412,20 @@ class MainWindow(QMainWindow):
             return
         
         self.btn_scan.setEnabled(False)
+        self.btn_pause.setEnabled(True)
         self.btn_find_duplicates.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.table_widget.setRowCount(0)
         self.current_duplicates = []
+        self.is_scanning = True
+        self.is_paused = False
+        self.btn_pause.setText("Пауза")
         
-        self.scan_worker = ScanWorker(self.folder_path, self.db_manager)
+        # Используем путь к БД напрямую
+        db_path = os.path.join(self.folder_path, "image_hashes.db")
+        
+        self.scan_worker = ScanWorker(self.folder_path, db_path)
         self.scan_worker.progress_signal.connect(self.update_progress)
         self.scan_worker.found_signal.connect(self.add_file_to_table)
         self.scan_worker.finished_signal.connect(self.on_scan_finished)
@@ -382,6 +433,24 @@ class MainWindow(QMainWindow):
         self.scan_worker.start()
         
         self.log_message("Начато сканирование...")
+    
+    def toggle_pause(self):
+        """Переключение паузы."""
+        if not self.scan_worker:
+            return
+        
+        if self.is_paused:
+            # Возобновить
+            self.scan_worker.resume()
+            self.btn_pause.setText("Пауза")
+            self.is_paused = False
+            self.log_message("Сканирование возобновлено")
+        else:
+            # Поставить на паузу
+            self.scan_worker.pause()
+            self.btn_pause.setText("Продолжить")
+            self.is_paused = True
+            self.log_message("Сканирование приостановлено")
     
     def update_progress(self, value, current_file):
         """Обновление прогресс бара."""
@@ -401,8 +470,11 @@ class MainWindow(QMainWindow):
     def on_scan_finished(self, files):
         """Завершение сканирования."""
         self.btn_scan.setEnabled(True)
+        self.btn_pause.setEnabled(False)
         self.btn_find_duplicates.setEnabled(True)
         self.progress_bar.setVisible(False)
+        self.is_scanning = False
+        self.is_paused = False
         self.lbl_status.setText(f"Сканирование завершено. Найдено {len(files)} изображений.")
         self.log_message(f"Сканирование завершено. Найдено {len(files)} изображений.")
     
@@ -462,8 +534,11 @@ class MainWindow(QMainWindow):
         self.log_message(f"ОШИБКА: {error_msg}")
         QMessageBox.warning(self, "Ошибка", error_msg)
         self.btn_scan.setEnabled(True)
+        self.btn_pause.setEnabled(False)
         self.btn_find_duplicates.setEnabled(True)
         self.progress_bar.setVisible(False)
+        self.is_scanning = False
+        self.is_paused = False
     
     def clear_database(self):
         """Очистка базы данных."""
