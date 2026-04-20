@@ -1,39 +1,7 @@
-```
-# Dependencies
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.env
-.env.local
-.env.*
-.venv/
-venv/
-.envrc
-
-# Build and distribution artifacts
-build/
-dist/
-*.egg-info/
-
-# Testing
-.coverage
-coverage/
-htmlcov/
-.pytest_cache/
-.mypy_cache/
-
-# Logs
-*.log
-
-# OS generated files
-.DS_Store
-Thumbs.db
-
-# Editor specific
-.vscode/
-.idea/
-*.swp
-*.swo
-*.tmp
-```
+#Images
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.gif
+*.webm

@@ -307,6 +307,7 @@ class MainWindow(QMainWindow):
         self.table_widget.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.table_widget.setSelectionBehavior(QTableWidget.SelectRows)
         self.table_widget.setSelectionMode(QTableWidget.ExtendedSelection)
+        self.table_widget.itemSelectionChanged.connect(self.update_preview)
         splitter.addWidget(self.table_widget)
         
         # Панель превью
@@ -505,6 +506,45 @@ class MainWindow(QMainWindow):
                         self.log_message(f"Не удалось удалить {file_path}: {e}")
             
             self.log_message(f"Удалено {deleted_count} файлов")
+    
+    def update_preview(self):
+        """Обновление превью изображения при выборе строки."""
+        selected_rows = self.table_widget.selectedItems()
+        if not selected_rows:
+            self.preview_label.setText("Превью изображения")
+            self.preview_label.setPixmap(QPixmap())
+            return
+        
+        # Получаем путь к файлу из первой выбранной строки
+        row = selected_rows[0].row()
+        file_path_item = self.table_widget.item(row, 1)
+        if not file_path_item:
+            return
+        
+        file_path = file_path_item.text()
+        
+        try:
+            from PIL import Image
+            # Открываем изображение с помощью Pillow
+            with Image.open(file_path) as img:
+                # Конвертируем в формат, подходящий для QPixmap
+                img = img.convert("RGB")
+                # Масштабируем для превью
+                preview_size = (300, 300)
+                img.thumbnail(preview_size, Image.Resampling.LANCZOS)
+                
+                # Создаем QPixmap из данных изображения
+                from io import BytesIO
+                buffer = BytesIO()
+                img.save(buffer, format="JPEG")
+                pixmap = QPixmap()
+                pixmap.loadFromData(buffer.getvalue())
+                
+                self.preview_label.setPixmap(pixmap)
+                self.preview_label.setText("")
+        except Exception as e:
+            self.preview_label.setText(f"Ошибка загрузки превью:\n{str(e)}")
+            self.preview_label.setPixmap(QPixmap())
     
     def closeEvent(self, event):
         """Закрытие приложения."""
