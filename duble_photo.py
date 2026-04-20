@@ -79,19 +79,18 @@ class DatabaseManager:
     
     def __init__(self, db_path="image_hashes.db"):
         self.db_path = db_path
-        self.conn = None
-        self.cursor = None
-        self._connect()
         self._create_tables()
     
-    def _connect(self):
-        """Подключение к базе данных."""
-        self.conn = sqlite3.connect(self.db_path)
-        self.cursor = self.conn.cursor()
+    def _get_connection(self):
+        """Создание нового соединения с базой данных."""
+        conn = sqlite3.connect(self.db_path)
+        return conn
     
     def _create_tables(self):
         """Создание таблиц если они не существуют."""
-        self.cursor.execute('''
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
             CREATE TABLE IF NOT EXISTS images (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 file_path TEXT UNIQUE NOT NULL,
@@ -100,7 +99,7 @@ class DatabaseManager:
                 scan_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        self.cursor.execute('''
+        cursor.execute('''
             CREATE TABLE IF NOT EXISTS duplicates (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 hash_group TEXT NOT NULL,
@@ -108,34 +107,40 @@ class DatabaseManager:
                 FOREIGN KEY (file_path) REFERENCES images(file_path)
             )
         ''')
-        self.conn.commit()
+        conn.commit()
+        conn.close()
     
     def add_image(self, file_path, file_hash, file_size):
         """Добавление изображения в базу данных."""
         try:
-            self.cursor.execute('''
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
                 INSERT OR REPLACE INTO images (file_path, file_hash, file_size)
                 VALUES (?, ?, ?)
             ''', (file_path, file_hash, file_size))
-            self.conn.commit()
+            conn.commit()
+            conn.close()
         except sqlite3.Error as e:
             print(f"Ошибка БД: {e}")
     
     def get_all_images(self):
         """Получение всех изображений из базы данных."""
-        self.cursor.execute('SELECT file_path, file_hash, file_size FROM images')
-        return self.cursor.fetchall()
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT file_path, file_hash, file_size FROM images')
+        result = cursor.fetchall()
+        conn.close()
+        return result
     
     def clear_database(self):
         """Очистка базы данных."""
-        self.cursor.execute('DELETE FROM images')
-        self.cursor.execute('DELETE FROM duplicates')
-        self.conn.commit()
-    
-    def close(self):
-        """Закрытие соединения с базой данных."""
-        if self.conn:
-            self.conn.close()
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM images')
+        cursor.execute('DELETE FROM duplicates')
+        conn.commit()
+        conn.close()
 
 
 class ScanWorker(QThread):
@@ -354,8 +359,6 @@ class MainWindow(QMainWindow):
             self.log_message(f"Выбрана папка: {folder}")
             
             # Инициализация БД
-            if self.db_manager:
-                self.db_manager.close()
             db_path = os.path.join(folder, "image_hashes.db")
             self.db_manager = DatabaseManager(db_path)
     
@@ -548,8 +551,6 @@ class MainWindow(QMainWindow):
     
     def closeEvent(self, event):
         """Закрытие приложения."""
-        if self.db_manager:
-            self.db_manager.close()
         event.accept()
 
 
