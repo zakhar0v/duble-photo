@@ -451,6 +451,28 @@ class MainWindow(QMainWindow):
             # Инициализация БД
             db_path = os.path.join(folder, "image_hashes.db")
             self.db_manager = DatabaseManager(db_path)
+
+            # Загружаем существующие данные из БД при выборе папки
+            self.load_existing_data_from_db(db_path)
+
+    def load_existing_data_from_db(self, db_path):
+        """Загрузка существующих данных из базы данных."""
+        try:
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            cursor.execute('SELECT file_path, file_hash, file_size FROM images')
+            rows = cursor.fetchall()
+            conn.close()
+
+            if rows:
+                self.table_widget.setRowCount(0)
+                for file_path, file_hash, file_size in rows:
+                    self.add_file_to_table(file_path, file_hash, file_size)
+                self.log_message(f"Загружено {len(rows)} записей из базы данных.")
+            else:
+                self.log_message("База данных пуста.")
+        except Exception as e:
+            self.log_message(f"Ошибка загрузки данных из БД: {e}")
     
     def start_scan(self):
         """Запуск сканирования."""
