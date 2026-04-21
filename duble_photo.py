@@ -9,7 +9,9 @@ import sys
 import hashlib
 import sqlite3
 import json
+import threading
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QProgressBar, QTextEdit,
@@ -77,6 +79,49 @@ class ImageHasher:
             return bin(xor).count('1')
         except ValueError:
             return float('inf')
+    
+    @staticmethod
+    def compute_hash_threaded(image_files, max_workers=None):
+        """
+        Многопоточное вычисление хэшей для списка изображений.
+        
+        Args:
+            image_files: Список путей к изображениям
+            max_workers: Максимальное количество потоков (по умолчанию используется CPU count)
+        
+        Returns:
+            Словарь {file_path: (hash, size)} или None при ошибке
+        """
+        if max_workers is None:
+            import multiprocessing
+            # Оптимизировано для I/O операций с файлами
+            max_workers = min(multiprocessing.cpu_count(), len(image_files))
+        
+        if max_workers <= 0 or len(image_files) == 0:
+            return {}
+        
+        results = {}
+        
+        def process_file(file_path):
+            """Обработка одного файла."""
+            try:
+                file_size = os.path.getsize(file_path)
+                file_hash = ImageHasher.compute_hash(file_path)
+                if file_hash:
+                    return (file_path, (file_hash, file_size))
+                return None
+            except Exception:
+                return None
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_file = {executor.submit(process_file, f): f for f in image_files}
+            
+            for future in as_completed(future_to_file):
+                result = future.result()
+                if result:
+                    results[result[0]] = result[1]
+        
+        return results
 
 
 class DatabaseManager:
@@ -181,7 +226,7 @@ class ScanWorker(QThread):
         self._stop_flag = True
     
     def run(self):
-        """Основной метод потока."""
+        """Основной метод потока с многопоточным хешированием."""
         try:
             all_files = []
             image_files = []
@@ -205,7 +250,11 @@ class ScanWorker(QThread):
             total = len(image_files_to_process)
             processed = 0
             
-            for file_path in image_files_to_process:
+            # Используем многопоточное хеширование для ускорения обработки
+            # Разбиваем файлы на пакеты для прогресс-бара
+            batch_size = max(10, total // 20)  # ~20 обновлений прогресса
+            
+            for i in range(0, len(image_files_to_process), batch_size):
                 if self._stop_flag:
                     # Сохраняем состояние перед остановкой
                     self._save_state(processed, image_files[:len(image_files)-len(image_files_to_process)+processed])
@@ -218,11 +267,18 @@ class ScanWorker(QThread):
                 if self._stop_flag:
                     break
                 
-                try:
-                    file_size = os.path.getsize(file_path)
-                    file_hash = ImageHasher.compute_hash(file_path)
+                # Обрабатываем пакет файлов многопоточно
+                batch = image_files_to_process[i:i + batch_size]
+                
+                # Многопоточное вычисление хэшей
+                results = ImageHasher.compute_hash_threaded(batch)
+                
+                # Сохраняем результаты в БД и отправляем сигналы
+                for file_path, (file_hash, file_size) in results.items():
+                    if self._stop_flag:
+                        break
                     
-                    if file_hash:
+                    try:
                         # Создаем новое соединение для каждого файла
                         conn = sqlite3.connect(self.db_path)
                         cursor = conn.cursor()
@@ -234,12 +290,11 @@ class ScanWorker(QThread):
                         conn.close()
                         
                         self.found_signal.emit(file_path, file_hash, file_size)
-                    
-                    processed += 1
-                    self.progress_signal.emit(int(100 * processed / max(total, 1)), file_path)
-                    
-                except Exception as e:
-                    self.error_signal.emit(f"Ошибка обработки {file_path}: {str(e)}")
+                        processed += 1
+                        self.progress_signal.emit(int(100 * processed / max(total, 1)), file_path)
+                        
+                    except Exception as e:
+                        self.error_signal.emit(f"Ошибка обработки {file_path}: {str(e)}")
             
             # Если дошли до конца, очищаем файл состояния
             completed = not self._stop_flag
